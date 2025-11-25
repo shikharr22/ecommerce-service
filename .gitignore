@@ -1,0 +1,44 @@
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+*.egg-info/
+*.egg
+*.log
+*.sqlite3
+
+# Virtual environment
+.venv/
+env/
+venv/
+
+# Jupyter (if you ever experiment)
+.ipynb_checkpoints/
+
+# --- VS Code ---
+.vscode/
+*.code-workspace
+
+# --- Environment / Secrets ---
+.env
+.env.*
+
+# --- Migrations cache (if Alembic later) ---
+alembic/__pycache__/
+alembic/versions/__pycache__/
+
+# --- Distribution / Packaging ---
+build/
+dist/
+*.whl
+
+# --- Docker ---
+# Container state shouldn't be in Git
+db_data/
+*.pid
+
+# --- OS / Editor noise ---
+.DS_Store
+Thumbs.db
