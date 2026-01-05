@@ -90,7 +90,7 @@ CREATE INDEX IF NOT EXISTS idx_order_items_variant_id ON order_items(variant_id)
 -- CART
 CREATE TABLE IF NOT EXISTS carts(
     id BIGSERIAL PRIMARY KEY,
-    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    user_id BIGINT UNIQUE NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -101,6 +101,7 @@ CREATE TABLE IF NOT EXISTS cart_items(
     cart_id BIGINT NOT NULL REFERENCES carts(id) ON DELETE CASCADE,
     variant_id BIGINT NOT NULL REFERENCES product_variants(id),
     quantity INT NOT NULL CHECK (quantity >0) 
+    UNIQUE (cart_id,variant_id)
 );
 
 -- INDEX ON cart items
