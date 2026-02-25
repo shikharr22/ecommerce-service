@@ -1,23 +1,67 @@
-# Ecommerce Service
+# ecommerce-service
 
-A REST API backend for an e-commerce platform built with Python, Flask, and PostgreSQL. This project is being built incrementally to learn and practice backend engineering fundamentals and advanced concepts.
+A backend REST API for an e-commerce platform, built with Python and Flask on top of PostgreSQL.
+
+This is a deliberate, phase-by-phase learning project. The goal is not just to ship working endpoints — it's to understand *why* each pattern exists, where it breaks down, and what the production trade-offs are. Every design decision here has a reason behind it.
+
+---
+
+## What I'm Practising
+
+This project is structured around concepts I'm actively working to understand deeply, not just use.
+
+**Phase 1 — Foundation (complete)**
+- **Connection pooling** — why opening a DB connection on every request is expensive, and how `pool_size` / `max_overflow` control behaviour under load
+- **ORM vs raw SQL** — both are used deliberately. SQLAlchemy ORM for models and relationships; raw SQL via `engine.connect()` for complex queries where the ORM would obscure what's actually hitting the database
+- **Application factory pattern** — `create_app()` instead of a module-level `app` singleton, so the app can be instantiated multiple times with different configs (critical for testing and avoiding circular imports)
+- **DB-level constraints as a safety net** — `CHECK (price_cents >= 0)`, `CHECK (available >= 0)`, `ON DELETE CASCADE` enforced in Postgres, not just in application code. Application validation is the first line; the DB is the last.
+- **Integer cents for money** — floats cannot represent all decimals exactly. `1999` means $19.99. No rounding errors, ever.
+- **TIMESTAMPTZ everywhere** — all timestamps stored in UTC, timezone-aware in Python. Naive datetimes are a silent bug waiting to happen.
+- **CHECK constraints over Postgres ENUMs** — adding a new order status is one `ALTER TABLE`, not `ALTER TYPE` + `ALTER TABLE`. Simpler to migrate.
+- **Idempotent seed data** — `ON CONFLICT DO NOTHING` means the seed script is safe to run repeatedly. Matters in development where you reset the DB often.
+- **Cascade design choices** — `ON DELETE CASCADE` for owned data (variants, cart items), `ON DELETE SET NULL` for referenced data (address → user) to preserve order history.
+
+**Phase 2 — REST API layer (next)**
+- Flask Blueprints for modular route organisation
+- Atomic checkout transaction: validate cart → reserve inventory → create order → clear cart, all in one DB transaction. Partial failure rolls back everything.
+- Cursor-based pagination (keyset pagination) vs offset pagination — why `OFFSET 1000` gets slower as the table grows
+- Request validation with Pydantic / Marshmallow
+
+**Phase 3 — Authentication**
+- JWT access + refresh token flow
+- bcrypt password hashing and why iteration count matters
+- `@login_required` decorator pattern
+
+**Phase 4 — Testing**
+- pytest + pytest-flask integration tests against a real test database
+- Factory Boy for fixture generation
+- Testing transactions and rollback behaviour
+
+**Phase 5 — Advanced**
+- Redis caching — cache-aside pattern, TTL strategy, cache invalidation
+- `SELECT FOR UPDATE` — pessimistic locking to prevent inventory oversell under concurrent checkout requests
+- Celery background tasks — async order confirmation emails, inventory sync
+- Rate limiting
+- Alembic for schema migrations (graduating from raw SQL files)
+- Structured logging and Prometheus metrics
 
 ---
 
 ## Tech Stack
 
-| Layer | Technology |
-|---|---|
-| Language | Python 3.x |
-| Framework | Flask 2.3.3 |
-| ORM | SQLAlchemy 2.x |
-| Database | PostgreSQL 15 |
-| Cache | Redis 7 |
-| Auth | JWT (`flask-jwt-extended`) |
-| Validation | Pydantic 2, Marshmallow |
-| Task Queue | Celery |
-| Testing | pytest, pytest-flask |
-| Containerisation | Docker + Docker Compose |
+| Layer | Technology | Status |
+|---|---|---|
+| Language | Python 3.x | Active |
+| Framework | Flask 2.3.3 | Active |
+| ORM | SQLAlchemy 2.x | Active |
+| Database | PostgreSQL 15 | Active |
+| Validation | Pydantic 2, Marshmallow | Phase 2 |
+| Auth | JWT (`flask-jwt-extended`), bcrypt | Phase 3 |
+| Cache | Redis 7 | Phase 5 |
+| Task Queue | Celery | Phase 5 |
+| Migrations | Alembic | Phase 5 |
+| Testing | pytest, pytest-flask, factory-boy | Phase 4 |
+| Containerisation | Docker + Docker Compose | Active |
 
 ---
 
@@ -26,146 +70,20 @@ A REST API backend for an e-commerce platform built with Python, Flask, and Post
 ```
 ecommerce-service/
 ├── sql/
-│   └── migrations/         # Raw SQL migration files (0001_init.sql, ...)
+│   └── migrations/         # Raw SQL files, numbered sequentially
 ├── src/
-│   ├── main.py             # Flask app + all routes (products, cart)
-│   ├── app.py              # App factory (create_app) + /health endpoint
-│   ├── db.py               # DB engine, SessionLocal, Base, get_db()
-│   ├── seed.py             # Seed script for development data
-│   ├── models/             # SQLAlchemy ORM models
-│   │   ├── user.py         # User
-│   │   ├── product.py      # Category, Product, ProductVariant, Inventory
-│   │   ├── order.py        # Address, Order, OrderItem
-│   │   └── cart.py         # Cart, CartItem
-│   └── app/                # Modular app package (services, schemas, repos)
-│       ├── models/         # ORM models (app-package style)
-│       ├── services/       # Business logic layer
-│       ├── repositories/   # Data access layer
-│       ├── schemas/        # Pydantic/Marshmallow schemas
-│       ├── core/           # Config, dependencies, exceptions
-│       └── utils/          # Helpers, validators, formatters
-├── docker-compose.yml      # PostgreSQL + Redis services
-├── requirements.txt        # Python dependencies
-├── Dockerfile              # Container definition
-├── AGENTS.md               # Guide for AI coding agents
-└── .env                    # Local environment variables (gitignored)
-```
-
----
-
-## Getting Started
-
-### Prerequisites
-
-- Python 3.10+
-- Docker and Docker Compose
-- `psql` (optional, for running migrations manually)
-
-### 1. Clone and set up the environment
-
-```bash
-git clone https://github.com/shikharr22/ecommerce-service.git
-cd ecommerce-service
-
-# Create and activate a virtual environment
-python -m venv .venv
-source .venv/bin/activate      # macOS/Linux
-.venv\Scripts\activate         # Windows
-
-# Install dependencies
-pip install -r requirements.txt
-```
-
-### 2. Configure environment variables
-
-Create a `.env` file in the project root:
-
-```env
-DATABASE_URL=postgresql://dev:devpass@localhost:5432/ecommerce_dev
-```
-
-### 3. Start the database and Redis
-
-```bash
-docker-compose up -d
-```
-
-This starts:
-- **PostgreSQL 15** on port `5432` — database auto-initialised from `sql/migrations/`
-- **Redis 7** on port `6379`
-
-### 4. Apply migrations (if not auto-applied)
-
-```bash
-psql $DATABASE_URL -f sql/migrations/0001_init.sql
-```
-
-### 5. Seed development data
-
-```bash
-python src/seed.py
-```
-
-Populates: 3 categories, 4 products with variants and inventory, 2 users (alice, bob), and a sample order.
-
-### 6. Run the development server
-
-```bash
-# Via Python
-python src/main.py
-
-# Or via Flask CLI
-flask --app src/app.py run --debug
-```
-
-The API will be available at `http://localhost:5000`.
-
----
-
-## API Endpoints
-
-### Health
-
-| Method | Path | Description |
-|---|---|---|
-| GET | `/health` | Liveness + DB connectivity check |
-
-### Products
-
-| Method | Path | Description |
-|---|---|---|
-| GET | `/products` | List products (pagination, filtering, search) |
-| GET | `/products/:id` | Get product with variants and inventory |
-
-**Query parameters for `GET /products`:**
-
-| Param | Type | Description |
-|---|---|---|
-| `limit` | int | Page size (default 20, max 100) |
-| `after` | int | Cursor — last product ID from previous page |
-| `category_id` | int | Filter by category |
-| `q` | string | Search by title (min 2 chars) |
-| `min_price_cents` | int | Minimum variant price in cents |
-| `max_price_cents` | int | Maximum variant price in cents |
-| `has_inventory` | bool | Filter by stock availability |
-
-### Cart
-
-All cart endpoints require the `X-User-Id` header (user ID as an integer).
-
-| Method | Path | Description |
-|---|---|---|
-| GET | `/carts/me` | Get current user's cart with items |
-| POST | `/carts/me/items` | Add an item to the cart |
-| PATCH | `/carts/me/items/:id` | Update item quantity (set to 0 to remove) |
-| DELETE | `/carts/me/items/:id` | Remove an item from the cart |
-
-**Example — add to cart:**
-```bash
-curl -X POST http://localhost:5000/carts/me/items \
-  -H "Content-Type: application/json" \
-  -H "X-User-Id: 1" \
-  -d '{"variant_id": 1, "quantity": 2}'
+│   ├── main.py             # Flask app + routes (products, cart)
+│   ├── app.py              # create_app() factory + /health
+│   ├── db.py               # Engine, SessionLocal, Base, get_db()
+│   ├── seed.py             # Idempotent dev seed data
+│   └── models/             # SQLAlchemy ORM models
+│       ├── user.py
+│       ├── product.py      # Category, Product, ProductVariant, Inventory
+│       ├── order.py        # Address, Order, OrderItem
+│       └── cart.py         # Cart, CartItem
+├── docker-compose.yml      # PostgreSQL 15 + Redis 7
+├── requirements.txt
+└── AGENTS.md               # Guide for AI coding agents working in this repo
 ```
 
 ---
@@ -182,39 +100,53 @@ orders → order_items
 carts → cart_items
 ```
 
-Key design decisions:
-- All prices stored as **integer cents** (no floats)
-- All timestamps stored as **TIMESTAMPTZ** (UTC)
-- Order statuses use **CHECK constraints**, not Postgres ENUMs
-- Inventory tracks `available` and `reserved` separately
-- Hard deletes throughout — no soft deletes
-
 ---
 
-## Testing
+## Getting Started
 
 ```bash
-# Run all tests
-pytest
+# 1. Clone and set up environment
+git clone https://github.com/shikharr22/ecommerce-service.git
+cd ecommerce-service
+python -m venv .venv
+.venv\Scripts\activate        # Windows
+source .venv/bin/activate     # macOS/Linux
+pip install -r requirements.txt
 
-# Run a single file
-pytest tests/test_products.py
+# 2. Create .env
+echo DATABASE_URL=postgresql://dev:devpass@localhost:5432/ecommerce_dev > .env
 
-# Run a single test
-pytest tests/test_products.py::test_get_product_by_id
+# 3. Start Postgres + Redis
+docker-compose up -d
 
-# With coverage
-pytest --cov=src
+# 4. Apply schema
+psql $DATABASE_URL -f sql/migrations/0001_init.sql
+
+# 5. Seed data
+python src/seed.py
+
+# 6. Run
+python src/main.py
 ```
 
 ---
 
-## Development Phases
+## Current Endpoints
 
-| Phase | Status | Description |
+| Method | Path | Description |
 |---|---|---|
-| 1 | Done | DB layer, ORM models, app factory, seed data |
-| 2 | Planned | Full REST API (products, orders, cart) |
-| 3 | Planned | Authentication (JWT + bcrypt) |
-| 4 | Planned | Testing (pytest + pytest-flask) |
-| 5 | Planned | Advanced concepts (caching, background jobs, pagination, locking) |
+| GET | `/health` | Liveness + DB connectivity check |
+| GET | `/products` | List products (filter, search, page) |
+| GET | `/products/:id` | Product detail with variants + stock |
+| GET | `/carts/me` | Current user's cart |
+| POST | `/carts/me/items` | Add item to cart |
+| PATCH | `/carts/me/items/:id` | Update item quantity |
+| DELETE | `/carts/me/items/:id` | Remove item from cart |
+
+Cart endpoints require `X-User-Id: <integer>` header.
+
+---
+
+## A Note on Tooling
+
+I used [OpenCode](https://opencode.ai) as an AI pair programmer throughout this project. It helped me implement, debug, and — more importantly — understand the *why* behind each pattern. The goal was never to copy-paste generated code, but to use it as a knowledgeable collaborator to learn faster and go deeper than I would reading docs alone.
