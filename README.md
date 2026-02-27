@@ -21,11 +21,14 @@ This project is structured around concepts I'm actively working to understand de
 - **Idempotent seed data** — `ON CONFLICT DO NOTHING` means the seed script is safe to run repeatedly. Matters in development where you reset the DB often.
 - **Cascade design choices** — `ON DELETE CASCADE` for owned data (variants, cart items), `ON DELETE SET NULL` for referenced data (address → user) to preserve order history.
 
-**Phase 2 — REST API layer (next)**
-- Flask Blueprints for modular route organisation
-- Atomic checkout transaction: validate cart → reserve inventory → create order → clear cart, all in one DB transaction. Partial failure rolls back everything.
-- Cursor-based pagination (keyset pagination) vs offset pagination — why `OFFSET 1000` gets slower as the table grows
-- Request validation with Pydantic / Marshmallow
+**Phase 2 — REST API layer (complete)**
+- **Flask Blueprints** — routes split into three domain blueprints (`products_bp`, `cart_bp`, `orders_bp`), all mounted under `/api/v1/`. Keeps route files focused and makes the app easier to navigate as it grows.
+- **Atomic checkout transaction** — `SELECT FOR UPDATE` on inventory rows → validate stock → decrement `available` + increment `reserved` → create order + order items → clear cart, all in one DB transaction. Any failure rolls back everything; no partial state is persisted.
+- **`SELECT FOR UPDATE` / pessimistic locking** — used in checkout to prevent inventory oversell under concurrent requests. Two users checking out the last item at the same time: only one succeeds.
+- **Cursor-based (keyset) pagination** — both `/products` and `/orders` paginate using `id > :after` rather than `LIMIT/OFFSET`. `OFFSET 1000` requires the DB to scan and discard 1000 rows every time; keyset skips directly to the right row via an index.
+- **Request validation with Marshmallow** — `AddCartItemSchema`, `UpdateCartItemSchema`, and `CheckoutSchema` validate and coerce input before it reaches business logic. Consistent `{ error: "..." }` shape on validation failure.
+- **Consistent response envelope** — all endpoints return `{ success, data, timestamp }` on success and `{ success: false, error: "..." }` on failure, enforced by global error handlers and a shared `success_response()` helper.
+- **Scaffolded layered architecture** (`src/app/`) — repository pattern, Pydantic v2 schemas, typed config dataclasses, and a rich custom exception hierarchy are committed as a planned refactor target, not yet wired into the running app.
 
 **Phase 3 — Authentication**
 - JWT access + refresh token flow
@@ -39,7 +42,6 @@ This project is structured around concepts I'm actively working to understand de
 
 **Phase 5 — Advanced**
 - Redis caching — cache-aside pattern, TTL strategy, cache invalidation
-- `SELECT FOR UPDATE` — pessimistic locking to prevent inventory oversell under concurrent checkout requests
 - Celery background tasks — async order confirmation emails, inventory sync
 - Rate limiting
 - Alembic for schema migrations (graduating from raw SQL files)
@@ -55,7 +57,7 @@ This project is structured around concepts I'm actively working to understand de
 | Framework | Flask 2.3.3 | Active |
 | ORM | SQLAlchemy 2.x | Active |
 | Database | PostgreSQL 15 | Active |
-| Validation | Pydantic 2, Marshmallow | Phase 2 |
+| Validation | Marshmallow (active), Pydantic 2 (scaffolded) | Active |
 | Auth | JWT (`flask-jwt-extended`), bcrypt | Phase 3 |
 | Cache | Redis 7 | Phase 5 |
 | Task Queue | Celery | Phase 5 |
@@ -72,15 +74,28 @@ ecommerce-service/
 ├── sql/
 │   └── migrations/         # Raw SQL files, numbered sequentially
 ├── src/
-│   ├── main.py             # Flask app + routes (products, cart)
-│   ├── app.py              # create_app() factory + /health
-│   ├── db.py               # Engine, SessionLocal, Base, get_db()
+│   ├── app.py              # create_app() factory — registers blueprints, global error handlers
+│   ├── main.py             # Legacy flat-file app (Phase 1 style, kept for reference)
+│   ├── db.py               # Engine, SessionLocal, Base, get_db(), get_connection()
 │   ├── seed.py             # Idempotent dev seed data
-│   └── models/             # SQLAlchemy ORM models
-│       ├── user.py
-│       ├── product.py      # Category, Product, ProductVariant, Inventory
-│       ├── order.py        # Address, Order, OrderItem
-│       └── cart.py         # Cart, CartItem
+│   ├── models/             # SQLAlchemy ORM models
+│   │   ├── user.py
+│   │   ├── product.py      # Category, Product, ProductVariant, Inventory
+│   │   ├── order.py        # Address, Order, OrderItem
+│   │   └── cart.py         # Cart, CartItem
+│   ├── routes/             # Flask Blueprints (Phase 2)
+│   │   ├── products.py     # GET /api/v1/products, GET /api/v1/products/<id>
+│   │   ├── cart.py         # Cart CRUD under /api/v1/carts
+│   │   ├── orders.py       # Checkout + order retrieval under /api/v1/orders
+│   │   ├── schemas.py      # Marshmallow request validation schemas
+│   │   └── utils.py        # success_response(), parse_int(), get_current_user_id()
+│   └── app/                # Scaffolded layered architecture (not yet wired in)
+│       ├── core/           # Typed config dataclasses, custom exception hierarchy
+│       ├── models/         # ORM models mirrored for the future service layer
+│       ├── repositories/   # Repository pattern (BaseRepository, CartRepository)
+│       ├── schemas/        # Pydantic v2 request/response models
+│       ├── services/       # Business logic (CartService, ProductService)
+│       └── utils/          # Date, formatting, validation helpers
 ├── docker-compose.yml      # PostgreSQL 15 + Redis 7
 ├── requirements.txt
 └── AGENTS.md               # Guide for AI coding agents working in this repo
@@ -126,24 +141,29 @@ psql $DATABASE_URL -f sql/migrations/0001_init.sql
 python src/seed.py
 
 # 6. Run
-python src/main.py
+flask --app src/app.py run --debug
 ```
 
 ---
 
 ## Current Endpoints
 
+All API endpoints are mounted under `/api/v1/`. The `/health` endpoint is at the root.
+
 | Method | Path | Description |
 |---|---|---|
 | GET | `/health` | Liveness + DB connectivity check |
-| GET | `/products` | List products (filter, search, page) |
-| GET | `/products/:id` | Product detail with variants + stock |
-| GET | `/carts/me` | Current user's cart |
-| POST | `/carts/me/items` | Add item to cart |
-| PATCH | `/carts/me/items/:id` | Update item quantity |
-| DELETE | `/carts/me/items/:id` | Remove item from cart |
+| GET | `/api/v1/products` | List products — cursor-based pagination, filter by `category_id`, `q` (search), `min_price_cents`, `max_price_cents`, `has_inventory`, `after` (cursor) |
+| GET | `/api/v1/products/<id>` | Product detail with all variants, inventory, `min/max_price_cents`, `in_stock` |
+| GET | `/api/v1/carts/me` | Current user's cart (auto-created if missing), with full line items and totals |
+| POST | `/api/v1/carts/me/items` | Add item to cart (upsert); validates stock and 99-item-per-line cap |
+| PATCH | `/api/v1/carts/me/items/<id>` | Update item quantity (`quantity=0` removes the item) |
+| DELETE | `/api/v1/carts/me/items/<id>` | Remove item from cart |
+| POST | `/api/v1/orders/checkout` | Atomic checkout — reserves inventory and creates order in one transaction |
+| GET | `/api/v1/orders` | List current user's orders, most-recent-first, cursor paginated |
+| GET | `/api/v1/orders/<id>` | Single order with full line items including variant and product details |
 
-Cart endpoints require `X-User-Id: <integer>` header.
+All endpoints (except `/health`) require an `X-User-Id: <integer>` header for user identity.
 
 ---
 
