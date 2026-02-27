@@ -1,10 +1,19 @@
+import logging
+from datetime import datetime, timezone
+
 from flask import Flask, jsonify
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
-from src.db import engine
-# Importing models registers them with Base.metadata — required before any
-# ORM operation or schema introspection.
-import src.models  # noqa: F401
+from db import engine
+from routes.products import products_bp
+from routes.cart import cart_bp
+from routes.orders import orders_bp
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+)
 
 
 def create_app() -> Flask:
@@ -20,49 +29,56 @@ def create_app() -> Flask:
     app = Flask(__name__)
 
     # ------------------------------------------------------------------ #
-    # Blueprints                                                           #
-    # Each domain gets its own Blueprint registered with a URL prefix.    #
-    # The actual route handlers will be added in Phase 2.                 #
+    # Blueprints — each domain registered under /api/v1/                  #
     # ------------------------------------------------------------------ #
-    # from src.routes.products import products_bp
-    # app.register_blueprint(products_bp, url_prefix="/api/v1/products")
-    #
-    # from src.routes.orders import orders_bp
-    # app.register_blueprint(orders_bp, url_prefix="/api/v1/orders")
+    app.register_blueprint(products_bp, url_prefix="/api/v1/products")
+    app.register_blueprint(cart_bp,     url_prefix="/api/v1/carts")
+    app.register_blueprint(orders_bp,   url_prefix="/api/v1/orders")
 
     # ------------------------------------------------------------------ #
-    # Request teardown                                                     #
+    # Error handlers — consistent JSON error envelope                     #
     # ------------------------------------------------------------------ #
-    @app.teardown_appcontext
-    def close_db_session(exception: BaseException | None) -> None:
-        """
-        Called automatically after every request context is popped.
-        Sessions are managed per-request via get_db(); nothing to clean up
-        at the app-context level beyond this hook existing as an extension
-        point for future scoped session support.
-        """
-        pass
+    @app.errorhandler(400)
+    def bad_request(e):
+        return jsonify({"success": False, "error": str(e.description)}), 400
+
+    @app.errorhandler(401)
+    def unauthorized(e):
+        return jsonify({"success": False, "error": str(e.description)}), 401
+
+    @app.errorhandler(404)
+    def not_found(e):
+        return jsonify({"success": False, "error": str(e.description)}), 404
+
+    @app.errorhandler(SQLAlchemyError)
+    def db_error(e):
+        return jsonify({"success": False, "error": "A database error occurred."}), 500
+
+    @app.errorhandler(500)
+    def internal_error(e):
+        return jsonify({"success": False, "error": "An internal server error occurred."}), 500
 
     # ------------------------------------------------------------------ #
     # Health check                                                         #
     # ------------------------------------------------------------------ #
     @app.get("/health")
-    def health() -> tuple:
-        """
-        Liveness + readiness probe.
-
-        Returns 200 if the app is running and can reach the database.
-        Returns 503 if the database is unreachable.
-
-        Useful for:
-        - Docker / Kubernetes health checks
-        - Verifying the app wired up correctly after deployment
-        """
+    def health():
+        """Liveness + readiness probe. Returns 503 if DB is unreachable."""
         try:
             with engine.connect() as conn:
                 conn.execute(text("SELECT 1"))
-            return jsonify({"status": "ok", "database": "reachable"}), 200
+            return jsonify({
+                "status": "ok",
+                "database": "reachable",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }), 200
         except Exception as exc:
             return jsonify({"status": "error", "database": str(exc)}), 503
 
     return app
+
+
+if __name__ == "__main__":
+    application = create_app()
+    application.run(debug=True, host="0.0.0.0", port=5000)
+

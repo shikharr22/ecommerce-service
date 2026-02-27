@@ -100,9 +100,11 @@ def validate_json_request(required_fields=None, max_size_mb=1):
                 data = request.get_json(force=True)
             except Exception as e:
                 abort(400, f"Invalid JSON format: {str(e)}")
+                return  # unreachable but satisfies type checker
                 
             if not data:
                 abort(400, "Request body cannot be empty")
+                return
             
             # Validate required fields
             if required_fields:
@@ -295,7 +297,8 @@ def list_products():
     if min_price_cents is not None and max_price_cents is not None and min_price_cents > max_price_cents:
         abort(400, "min_price_cents cannot be greater than max_price_cents")
     
-    has_inventory = parse_bool(request.args.get("has_inventory"), default=None)
+    has_inventory_raw = request.args.get("has_inventory")
+    has_inventory = parse_bool(has_inventory_raw) if has_inventory_raw is not None else None
     
     sql="""SELECT p.id AS product_id,
              p.sku AS product_sku,
@@ -317,9 +320,9 @@ def list_products():
         sql+='AND p.category_id=:category_id '
         params["category_id"]=category_id
         
-    if q:
+    if search_query:
         sql+='AND p.title ILIKE :q '
-        params["q"]=f"%{q}%"
+        params["q"]=f"%{search_query}%"
         
     sql += """GROUP BY p.id , p.sku , p.title """
          

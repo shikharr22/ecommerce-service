@@ -1,0 +1,258 @@
+================================================================================
+BE FUNDAMENTALS — LEARNING NOTES
+================================================================================
+
+--------------------------------------------------------------------------------
+PHASE 1 — db.py
+--------------------------------------------------------------------------------
+
+1. CONNECTION POOLING
+   Reusing a set of live database connections instead of opening a new TCP
+   connection on every HTTP request. Opening a connection costs ~5-10ms.
+   pool_size=5 keeps 5 connections open permanently. max_overflow=10 allows
+   10 more under burst load. pool_timeout=30 makes new requests wait up to
+   30s before failing if all connections are busy.
+
+2. ENVIRONMENT-BASED CONFIGURATION
+   Credentials and environment-specific values (DATABASE_URL) are loaded from
+   a .env file via python-dotenv, never hardcoded in source code. This means
+   the same codebase runs in dev, staging, and production without changes —
+   only the environment variables differ.
+
+3. URL NORMALISATION
+   Some platforms (Heroku, Railway) emit postgres:// but SQLAlchemy 1.4+
+   requires postgresql://. Normalising at the boundary (db.py) means the
+   rest of the app never has to think about it.
+
+4. ORM SESSION vs RAW CONNECTION
+   Two distinct DB access patterns used deliberately:
+   - ORM session (SessionLocal / get_db()) for object-mapped queries where
+     relationships, cascade, and Python-object ergonomics matter.
+   - Raw connection (get_connection()) for complex SQL where the ORM would
+     obscure what is actually hitting the database.
+
+5. TRANSACTION CONTROL
+   autocommit=False means nothing is written to the DB until session.commit()
+   is called explicitly. This is what makes transactions possible — multiple
+   writes can be grouped and either all committed or all rolled back together.
+   autoflush=False means SQLAlchemy does not silently sync pending changes
+   before queries; the developer controls when flushes happen.
+
+6. GENERATOR-BASED RESOURCE CLEANUP
+   get_db() uses yield inside try/finally. The caller receives the session at
+   yield, uses it, and when it is done (or if it raises an exception),
+   execution resumes at finally: db.close(). The finally block runs no matter
+   what — guaranteeing the session is closed and the connection is returned
+   to the pool. This is the standard resource cleanup pattern in Python.
+
+7. DECLARATIVE BASE
+   Base = declarative_base() creates a shared registry. Every ORM model
+   inherits from Base, which is how SQLAlchemy knows which Python classes
+   map to which database tables and tracks relationships between them.
+
+8. PARAMETERISED QUERIES via text()
+   text() wraps raw SQL strings so SQLAlchemy handles bound parameters safely.
+   Values are passed separately as a dict (e.g. {"pid": product_id}) and never
+   interpolated directly into the SQL string. This prevents SQL injection —
+   user-supplied values cannot alter the structure of the query.
+
+9. NAMED COLUMN ACCESS via .mappings()
+   .mappings() returns rows as dict-like objects so columns are accessed by
+   name (row["id"]) instead of by position (row[0]). Makes code readable,
+   self-documenting, and safe to refactor when column order changes.
+
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+PHASE 1 — src/models/product.py  (ORM: SQLAlchemy 1.x declarative style)
+--------------------------------------------------------------------------------
+
+1. ORM (OBJECT-RELATIONAL MAPPER)
+   SQLAlchemy maps Python classes to database tables. Each class attribute
+   defined with Column() maps to a table column. Instances of the class
+   represent rows. This lets you work with Python objects instead of writing
+   raw SQL for every operation. We use the 1.x declarative style:
+   declarative_base(), Column(), relationship() — the classic API that still
+   works on SQLAlchemy 2.x.
+
+2. BigInteger vs Integer FOR PRIMARY KEYS
+   BigInteger is a 64-bit integer (max ~9.2 billion). Integer is 32-bit
+   (max ~2.1 billion). Always use BigInteger for IDs — you never want to
+   hit the ceiling on a live system. The cost is negligible; the downside
+   of getting it wrong is catastrophic.
+
+3. RELATIONSHIPS AND back_populates
+   relationship() defines the Python-level link between two models.
+   back_populates keeps both sides in sync in memory — setting
+   product.category = c also adds product to c.products. Without it,
+   only the side you set is updated in the current session.
+
+4. CASCADE — ORM-LEVEL AND DB-LEVEL
+   cascade="all, delete-orphan" on a relationship means deleting a parent
+   object in the ORM session also deletes its children. This mirrors
+   ON DELETE CASCADE in the SQL schema. Both are needed: the DB constraint
+   is the hard enforcement; the ORM cascade keeps the in-memory session
+   consistent so you don't work with stale objects after a delete.
+
+5. uselist=False — ONE-TO-ONE RELATIONSHIPS
+   By default SQLAlchemy relationships return a list. uselist=False tells
+   SQLAlchemy this is a one-to-one: variant.inventory returns a single
+   object, not a list. This makes the relationship's cardinality explicit
+   and enforced at the Python level.
+
+6. lambda DEFAULT vs BARE VALUE DEFAULT
+   default=lambda: datetime.now(timezone.utc) is correct.
+   default=datetime.now(timezone.utc) is a bug — the bare call is evaluated
+   once at import time, so every row would get the same timestamp. The lambda
+   is called fresh on each insert.
+
+7. MONEY AS INTEGER CENTS
+   Floats use IEEE 754 binary representation and cannot represent all decimal
+   values exactly (0.1 + 0.2 = 0.30000000000000004). Money is stored as
+   integer cents (1999 = $19.99). No rounding errors, ever. This is standard
+   practice across all production financial systems.
+
+8. JSONB FOR FLEXIBLE ATTRIBUTES
+   JSONB stores arbitrary structured data (e.g. {"size": "M", "color": "red"})
+   without requiring schema changes for new attribute types. Unlike plain JSON,
+   JSONB is stored in a decomposed binary format that supports GIN indexing,
+   making containment queries (@>) fast. default=dict passes the dict
+   constructor as a factory so each row gets a fresh empty dict.
+
+9. CHECK CONSTRAINTS AT THE DATABASE LEVEL
+   CheckConstraint("price_cents >= 0") is enforced by Postgres, not just the
+   application. Application-level validation is the first line of defence;
+   DB constraints are the last. Named constraints (ck_variant_price) make
+   error messages and migration scripts easier to read and maintain.
+
+10. NATURAL PRIMARY KEY
+    Inventory uses variant_id as its primary key instead of a surrogate id
+    column. Each variant has exactly one inventory row, so the variant ID is
+    the identity of the row. A natural key when it exists is preferable —
+    it avoids an extra column and makes the one-to-one constraint explicit
+    at the schema level.
+
+11. AVAILABLE vs RESERVED INVENTORY SPLIT
+    available = units that can be added to a cart.
+    reserved  = units held in active carts, not yet paid.
+    On checkout:        decrement available, increment reserved.
+    On payment success: decrement reserved.
+    On failure/timeout: increment available (release the reservation).
+    This prevents overselling without locking the inventory row for the
+    entire duration of the checkout flow.
+
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+PHASE 1 — REMAINING MODELS, APP FACTORY, SEED DATA
+--------------------------------------------------------------------------------
+
+1. UNIQUE CONSTRAINT AS IMPLICIT INDEX
+   Marking a column unique=True does two things: enforces uniqueness at the
+   DB level, and automatically creates a unique index on that column. This
+   means lookups like WHERE email = :email are fast without manually defining
+   a separate index.
+
+2. NULLABLE FOREIGN CREDENTIALS FOR OAUTH/SSO SUPPORT
+   hashed_password is nullable so the table can support OAuth/SSO sign-ins
+   (Google, GitHub) where no local password exists. A user authenticated via
+   a third-party provider never sets a password — their row has
+   hashed_password = NULL.
+
+3. SCHEMA-LEVEL NAMING CONVENTIONS
+   Naming the column hashed_password instead of password makes it explicit
+   in the schema itself that plaintext passwords are never stored. Anyone
+   reading the schema knows a hash function was applied, without needing
+   to read application code.
+
+4. ON DELETE SET NULL FOR PRESERVING HISTORICAL REFERENCES
+   When a user is deleted, their addresses are kept with user_id = NULL.
+   Orders still reference those addresses for historical record-keeping.
+   CASCADE would delete the addresses and break order foreign keys. SET NULL
+   preserves the audit trail while severing the link to the deleted user.
+
+5. CHECK CONSTRAINTS OVER POSTGRES ENUMs FOR STATUS FIELDS
+   Adding a new status value to a Postgres ENUM requires ALTER TYPE then
+   ALTER TABLE — two steps, and ALTER TYPE locks the table. With a CHECK
+   constraint, it is one ALTER TABLE. Simpler, safer to migrate.
+
+6. IMMUTABILITY / AUDIT PATTERN FOR FINANCIAL TOTALS
+   total_cents is stored on the order even though it could be recomputed
+   from order_items. Once an order is created, its total is a historical
+   fact. Variant prices can change later — the charged amount must not.
+
+7. SNAPSHOTTING PRICES AT PURCHASE TIME
+   unit_price_cents on order_items is copied from the variant at the moment
+   of purchase. If the variant's price changes the next day, existing orders
+   are unaffected. The snapshot is the source of truth for what the customer
+   actually paid.
+
+8. DENORMALISATION FOR READ PERFORMANCE
+   subtotal_cents = unit_price_cents * quantity is stored explicitly even
+   though it is derivable. This avoids recomputing it on every read and
+   locks in the correct value as of purchase time.
+
+9. RESERVED ATTRIBUTE NAME COLLISION HANDLING
+   metadata is a reserved attribute name in SQLAlchemy's Base. The Python
+   attribute is named metadata_ (trailing underscore) while the actual DB
+   column is still named metadata via Column("metadata", JSONB...). The
+   underscore avoids the internal collision without changing the schema.
+
+10. NULLABLE FIELDS FOR DEFERRED DATA
+    payment_provider_id is nullable because it only exists after a payment
+    attempt. At status='created' no payment has been made yet. Nullable
+    fields model the lifecycle of data that arrives at different points in
+    time.
+
+11. FUTURE-PROOFING VIA DEFAULTS
+    currency defaults to "USD". This means multi-currency support can be
+    added later by simply populating the field — no schema change required.
+    Good defaults make forward compatibility cheap.
+
+12. DELETE STRATEGY DRIVEN BY DOMAIN
+    Cart uses ON DELETE CASCADE — an orphaned cart has no value if its user
+    is gone. Address uses ON DELETE SET NULL — addresses have historical
+    value even after a user is deleted. The foreign key delete strategy
+    should reflect the business meaning of the relationship, not a blanket
+    rule.
+
+13. onupdate FOR ABANDONED CART DETECTION
+    updated_at with onupdate=lambda: datetime.now(timezone.utc) is set
+    automatically by SQLAlchemy on every update. This timestamp can be
+    used to detect and expire abandoned carts — if updated_at is older
+    than N days, the cart can be cleaned up by a background job.
+
+14. ZERO-QUANTITY AS INVALID STATE
+    quantity > 0 is enforced by a CHECK constraint. A quantity of 0 is not
+    a valid cart item state — to remove an item you delete the row. This
+    keeps the data model clean and prevents a whole class of bugs where
+    zero-quantity items silently persist.
+
+15. APPLICATION FACTORY PATTERN
+    create_app() is a function that builds and returns a Flask app instead
+    of defining app = Flask(__name__) at module level. Benefits:
+    - Testing: call create_app() with a test config (different DB URL,
+      TESTING=True) to get a fresh isolated app per test.
+    - Multiple instances: same codebase, different configs in one process.
+    - Circular imports: the factory defers app construction to call time
+      so importing the module does not execute the entire app setup.
+
+16. LIVENESS / HEALTH CHECK ENDPOINT
+    /health is a standard probe hit by load balancers and orchestrators
+    (Kubernetes, ECS) to decide if an instance is healthy enough to receive
+    traffic. It tests DB connectivity so it reflects real application health,
+    not just "process is running".
+
+17. IDEMPOTENT SEED DATA VIA ON CONFLICT DO NOTHING
+    ON CONFLICT (column) DO NOTHING silently skips an insert if a unique
+    constraint violation would occur. Running the seed script multiple times
+    produces the same result every time — no duplicates, no errors. Essential
+    in development where the DB is frequently reset and reseeded.
+
+18. INSERTION ORDER RESPECTING FOREIGN KEY DEPENDENCIES
+    Seed data must be inserted in dependency order: categories before
+    products, products before variants, users before orders, etc. Foreign
+    key constraints enforce this at the DB level — inserting a child row
+    before its parent exists will fail.
+
+--------------------------------------------------------------------------------
